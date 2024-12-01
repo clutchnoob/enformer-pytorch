@@ -295,7 +295,8 @@ class Attention(nn.Module):
 
 # main class
 
-class AutoEnformer(PreTrainedModel):
+
+class Enformer(PreTrainedModel):
     config_class = EnformerConfig
     base_model_prefix = "enformer"
 
@@ -317,30 +318,46 @@ class AutoEnformer(PreTrainedModel):
             AttentionPool(half_dim, pool_size = 2)
         )
 
-        # create autoencoder to replace conv tower
+        # create conv tower
 
-        # Encoder
-        encoder_layers = [
-            nn.Conv1d(half_dim, half_dim * 2, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(half_dim * 2),
-            GELU(),
-            nn.Conv1d(half_dim * 2, config.dim, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(config.dim),
-            GELU()
-        ]
+        filter_list = exponential_linspace_int(half_dim, config.dim, num = (config.num_downsamples - 1), divisible_by = config.dim_divisible_by)
+        filter_list = [half_dim, *filter_list]
 
-        # Decoder
-        decoder_layers = [
-            nn.ConvTranspose1d(config.dim, half_dim * 2, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.BatchNorm1d(half_dim * 2),
-            GELU(),
-            nn.ConvTranspose1d(half_dim * 2, half_dim, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.BatchNorm1d(half_dim),
-            GELU()
-        ]
-
-        # Autoencoder
-        self.autoencoder = nn.Sequential(*encoder_layers, *decoder_layers)
+        # encoder
+        encoder_layers = []
+        for dim_in, dim_out in zip(filter_list[:-1], filter_list[1:]):
+            encoder_layers.append(nn.Sequential(
+                ConvBlock(dim_in, dim_out, kernel_size=5),
+                Residual(ConvBlock(dim_out, dim_out, 1)),
+                AttentionPool(dim_out, pool_size=2)
+            ))
+        
+        # bottleneck
+        bottleneck_dim = filter_list[-1]
+        self.bottleneck = nn.Sequential(
+            ConvBlock(bottleneck_dim, bottleneck_dim // 2, kernel_size=1),
+            ConvBlock(bottleneck_dim // 2, bottleneck_dim, kernel_size=1)
+        )
+        
+        # decoder
+        decoder_layers = []
+        reversed_filters = list(reversed(filter_list))
+        for dim_in, dim_out in zip(reversed_filters[:-1], reversed_filters[1:]):
+            decoder_layers.append(nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                ConvBlock(dim_in, dim_out, kernel_size=5),
+                Residual(ConvBlock(dim_out, dim_out, 1))
+            ))
+        
+        self.encoder = nn.Sequential(*encoder_layers)
+        self.decoder = nn.Sequential(*decoder_layers)
+        
+        # combine into autoencoder tower
+        self.conv_tower = nn.Sequential(
+            self.encoder,
+            self.bottleneck,
+            self.decoder
+        )
 
         # whether to use tensorflow gamma positions
 
@@ -387,7 +404,7 @@ class AutoEnformer(PreTrainedModel):
 
         self.final_pointwise = nn.Sequential(
             Rearrange('b n d -> b d n'),
-            ConvBlock(half_dim, twice_dim, 1),
+            ConvBlock(filter_list[-1], twice_dim, 1),
             Rearrange('b d n -> b n d'),
             nn.Dropout(config.dropout_rate / 8),
             GELU()
@@ -398,7 +415,7 @@ class AutoEnformer(PreTrainedModel):
         self._trunk = nn.Sequential(
             Rearrange('b n d -> b d n'),
             self.stem,
-            self.autoencoder,
+            self.conv_tower,
             Rearrange('b d n -> b n d'),
             self.transformer,
             self.crop_final,
@@ -412,6 +429,40 @@ class AutoEnformer(PreTrainedModel):
         # use checkpointing on transformer trunk
 
         self.use_checkpointing = config.use_checkpointing
+
+    def train_autoencoder(model, train_loader, val_loader, num_epochs=100):
+        optimizer = torch.optim.Adam(model.conv_tower.parameters(), lr=1e-4)
+        reconstruction_loss = nn.MSELoss()
+        
+        for epoch in range(num_epochs):
+            # Training phase
+            model.conv_tower.train()
+            for batch in train_loader:
+                # Forward pass through stem
+                with torch.no_grad():
+                    stem_output = model.stem(batch)
+                
+                # Forward pass through autoencoder
+                encoded = model.encoder(stem_output)
+                bottleneck = model.bottleneck(encoded)
+                decoded = model.decoder(bottleneck)
+                
+                # Calculate loss
+                loss = reconstruction_loss(decoded, stem_output)
+                
+                # Backpropagation
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+            # Validation phase
+            model.conv_tower.eval()
+            with torch.no_grad():
+                val_loss = 0
+                for batch in val_loader:
+                    stem_output = model.stem(batch)
+                    reconstructed = model.conv_tower(stem_output)
+                    val_loss += reconstruction_loss(reconstructed, stem_output)
 
     def add_heads(self, **kwargs):
         self.output_heads = kwargs
@@ -436,7 +487,7 @@ class AutoEnformer(PreTrainedModel):
     def trunk_checkpointed(self, x):
         x = rearrange(x, 'b n d -> b d n')
         x = self.stem(x)
-        x = self.autoencoder(x)
+        x = self.conv_tower(x)
         x = rearrange(x, 'b d n -> b n d')
         x = checkpoint_sequential(self.transformer, len(self.transformer), x)
         x = self.crop_final(x)
@@ -498,7 +549,7 @@ class AutoEnformer(PreTrainedModel):
 
 # from pretrained function
 
-'''def from_pretrained(name, use_tf_gamma = None, **kwargs):
+def from_pretrained(name, use_tf_gamma = None, **kwargs):
     enformer = Enformer.from_pretrained(name, **kwargs)
 
     if name == 'EleutherAI/enformer-official-rough':
@@ -508,4 +559,4 @@ class AutoEnformer(PreTrainedModel):
             if isinstance(module, Attention):
                 module.use_tf_gamma = use_tf_gamma
 
-    return enformer'''
+    return enformer
