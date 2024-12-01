@@ -295,7 +295,7 @@ class Attention(nn.Module):
 
 # main class
 
-class Enformer(PreTrainedModel):
+class AutoEnformer(PreTrainedModel):
     config_class = EnformerConfig
     base_model_prefix = "enformer"
 
@@ -317,21 +317,30 @@ class Enformer(PreTrainedModel):
             AttentionPool(half_dim, pool_size = 2)
         )
 
-        # create conv tower
+        # create autoencoder to replace conv tower
 
-        filter_list = exponential_linspace_int(half_dim, config.dim, num = (config.num_downsamples - 1), divisible_by = config.dim_divisible_by)
-        filter_list = [half_dim, *filter_list]
+        # Encoder
+        encoder_layers = [
+            nn.Conv1d(half_dim, half_dim * 2, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(half_dim * 2),
+            GELU(),
+            nn.Conv1d(half_dim * 2, config.dim, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(config.dim),
+            GELU()
+        ]
 
-        # replace this dude with an autoencoder
-        conv_layers = []
-        for dim_in, dim_out in zip(filter_list[:-1], filter_list[1:]):
-            conv_layers.append(nn.Sequential(
-                ConvBlock(dim_in, dim_out, kernel_size = 5),
-                Residual(ConvBlock(dim_out, dim_out, 1)),
-                AttentionPool(dim_out, pool_size = 2)
-            ))
+        # Decoder
+        decoder_layers = [
+            nn.ConvTranspose1d(config.dim, half_dim * 2, kernel_size=5, stride=2, padding=2, output_padding=1),
+            nn.BatchNorm1d(half_dim * 2),
+            GELU(),
+            nn.ConvTranspose1d(half_dim * 2, half_dim, kernel_size=5, stride=2, padding=2, output_padding=1),
+            nn.BatchNorm1d(half_dim),
+            GELU()
+        ]
 
-        self.conv_tower = nn.Sequential(*conv_layers)
+        # Autoencoder
+        self.autoencoder = nn.Sequential(*encoder_layers, *decoder_layers)
 
         # whether to use tensorflow gamma positions
 
@@ -378,7 +387,7 @@ class Enformer(PreTrainedModel):
 
         self.final_pointwise = nn.Sequential(
             Rearrange('b n d -> b d n'),
-            ConvBlock(filter_list[-1], twice_dim, 1),
+            ConvBlock(half_dim, twice_dim, 1),
             Rearrange('b d n -> b n d'),
             nn.Dropout(config.dropout_rate / 8),
             GELU()
@@ -389,7 +398,7 @@ class Enformer(PreTrainedModel):
         self._trunk = nn.Sequential(
             Rearrange('b n d -> b d n'),
             self.stem,
-            self.conv_tower,
+            self.autoencoder,
             Rearrange('b d n -> b n d'),
             self.transformer,
             self.crop_final,
@@ -427,7 +436,7 @@ class Enformer(PreTrainedModel):
     def trunk_checkpointed(self, x):
         x = rearrange(x, 'b n d -> b d n')
         x = self.stem(x)
-        x = self.conv_tower(x)
+        x = self.autoencoder(x)
         x = rearrange(x, 'b d n -> b n d')
         x = checkpoint_sequential(self.transformer, len(self.transformer), x)
         x = self.crop_final(x)
@@ -489,7 +498,7 @@ class Enformer(PreTrainedModel):
 
 # from pretrained function
 
-def from_pretrained(name, use_tf_gamma = None, **kwargs):
+'''def from_pretrained(name, use_tf_gamma = None, **kwargs):
     enformer = Enformer.from_pretrained(name, **kwargs)
 
     if name == 'EleutherAI/enformer-official-rough':
@@ -499,4 +508,4 @@ def from_pretrained(name, use_tf_gamma = None, **kwargs):
             if isinstance(module, Attention):
                 module.use_tf_gamma = use_tf_gamma
 
-    return enformer
+    return enformer'''
